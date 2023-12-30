@@ -2,3 +2,161 @@ library(readr)
 library(dplyr)
 library(tsibble)
 library(tidyverse)
+
+# Set the path to the dataset
+# Update this to your actual file path
+file_path <- "/Users/fifiding/Downloads/BAFT/Store_Item_Data.csv" 
+
+# Load the dataset
+data <- read_csv(file_path, show_col_types = FALSE)
+
+# Convert data fields
+data <- data |> 
+  mutate(`Week and Year` = as.character(`Week and Year`),
+         SKU_Nbr = as.factor(SKU_Nbr),
+         `Purchase Channel` = as.factor(`Purchase Channel`))
+
+# Aggregate the data
+data <- data %>%
+  group_by(SKU_Nbr, `Purchase Channel`, `Week and Year`) |>
+  summarise(
+    This_Year_Sales = sum(`This Year Sales ($)`, na.rm = TRUE),
+    Last_Year_Sales = sum(`Last Year Sales ($)`, na.rm = TRUE),
+    This_Year_Sales_Qty = sum(`This Year Sales Qty`, na.rm = TRUE),
+    Last_Year_Sales_Qty = sum(`Last Year Sales Qty`, na.rm = TRUE),
+    .groups = 'drop' # Drop the grouping
+  )
+
+# Helper function to decrease the year in 'Week and Year'
+decrease_year <- function(week_and_year) {
+  paste0(as.numeric(substr(week_and_year, 1, 4)) - 1,
+         substr(week_and_year, 5, 8))
+}
+
+# Create the 'Last Year' data frame with adjusted 'Week and Year'
+last_year_data <- data |>
+  transmute(
+    SKU_Nbr,
+    `Purchase Channel`,
+    `Week and Year` = decrease_year(`Week and Year`),
+    Sales = Last_Year_Sales,
+    Sales_Qty = Last_Year_Sales_Qty
+  )
+
+# Create the 'This Year' data frame
+this_year_data <- data %>%
+  transmute(
+    SKU_Nbr,
+    `Purchase Channel`,
+    `Week and Year`,
+    Sales = This_Year_Sales,
+    Sales_Qty = This_Year_Sales_Qty
+  )
+
+# Combine 'This Year' and 'Last Year' data into a single data frame
+combined_data <- bind_rows(this_year_data, last_year_data)
+
+# Dealing with missing values
+
+# Define the range of weeks to select from, excluding the target week '202212'
+weeks_range <- setdiff(202207:202217, 202212)
+
+# Get the SKUs present in week 202212
+skus_in_202212 <- combined_data %>%
+  filter(`Week and Year` == "202212") %>%
+  select(SKU_Nbr, `Purchase Channel`)
+
+# Calculate the average of the last 4 weeks for each SKU for the target weeks '202213' and '202214'
+target_weeks <- c("202213", "202214")
+averages_list <- list()
+
+for (sku in unique(skus_in_202212$SKU_Nbr)) {
+  for (channel in unique(skus_in_202212$`Purchase Channel`)) {
+    sku_channel_data <- combined_data %>% 
+      filter(SKU_Nbr == sku, `Purchase Channel` == channel)
+    for (target_week in target_weeks) {
+      # Sample 4 random weeks from the range
+      random_weeks <- sample(weeks_range, 4)
+      # Calculate the average for the randomly selected weeks
+      average_data <- sku_channel_data %>%
+        filter(`Week and Year` %in% random_weeks) %>%
+        summarise(
+          Avg_Sales = mean(Sales, na.rm = TRUE),
+          Avg_Sales_Qty = round(mean(Sales_Qty, na.rm = TRUE), 0)
+        ) %>%
+        mutate(`Week and Year` = target_week, 
+               SKU_Nbr = sku,
+               # Include SKU_Nbr and Purchase Channel here
+               `Purchase Channel` = channel) 
+      # Store the results
+      averages_list[[paste(sku, channel, target_week)]] <- average_data
+    }
+  }
+}
+
+# Combine the average data for all SKUs, channels, and both target weeks
+average_last_4_weeks <- bind_rows(averages_list)
+
+# Create a data frame for the missing weeks
+missing_weeks <- tibble(`Week and Year` = c("202213", "202214"))
+
+# Cross join to create all combinations of SKUs, channels, and missing weeks
+missing_data <- skus_in_202212 %>%
+  full_join(missing_weeks, by = character()) %>%
+  left_join(average_last_4_weeks, 
+            by = c("SKU_Nbr", "Purchase Channel", "Week and Year"))
+
+# Add the missing data to the original dataset
+final_data <- bind_rows(combined_data, missing_data) %>%
+  arrange(SKU_Nbr, `Purchase Channel`, `Week and Year`)
+
+# Combine the columns with NA and those that have data
+final_data <- final_data %>%
+  mutate(
+    Sales = coalesce(Sales, Avg_Sales),
+    Sales_Qty = coalesce(Sales_Qty, Avg_Sales_Qty)
+  ) %>%
+  select(SKU_Nbr, `Purchase Channel`, `Week and Year`, Sales, Sales_Qty)
+
+# General_level Dataset
+General_level <- final_data %>%
+  group_by(SKU_Nbr, `Week and Year`) %>%
+  summarise(
+    Sales = sum(Sales, na.rm = TRUE),
+    Sales_Qty = sum(Sales_Qty, na.rm = TRUE)
+  ) %>%
+  mutate(
+    Price = ifelse(Sales_Qty == 0, NA, Sales / Sales_Qty)
+  ) %>%
+  fill(Price, .direction = "down") %>%
+  ungroup()
+
+# Purchase_Channel_level Dataset
+Channel_level <- final_data %>%
+  mutate(
+    Price = ifelse(Sales_Qty == 0, NA, Sales / Sales_Qty)
+  ) %>%
+  arrange(SKU_Nbr, `Purchase Channel`, `Week and Year`) %>%
+  group_by(SKU_Nbr, `Purchase Channel`) %>%
+  # Using tidyr::fill to carry forward the last known price within each group
+  fill(Price, .direction = "down") %>%
+  ungroup()
+
+# List all variables currently in the environment
+all_variables <- ls()
+
+# Specify the variables you want to keep
+variables_to_keep <- c("General_level", "Channel_level")
+
+# Identify which variables to remove
+variables_to_remove <- setdiff(all_variables, variables_to_keep)
+
+# Remove the variables   
+rm(list = variables_to_remove)
+
+# Clear the variables used in the removal process
+rm(all_variables, variables_to_keep, variables_to_remove)
+
+# Export preprocessed dataset for General_Level and Purchase_Channel_Level
+write.csv(General_level, "General_Level.csv", row.names = FALSE)
+write.csv(Channel_level, "Purchase_Channel_Level.csv", row.names = FALSE)
